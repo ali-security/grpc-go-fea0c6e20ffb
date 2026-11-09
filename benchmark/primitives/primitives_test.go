@@ -425,3 +425,65 @@ func BenchmarkRLockUnlock(b *testing.B) {
 		}
 	})
 }
+
+type ifNop interface {
+	nop()
+}
+
+type alwaysNop struct{}
+
+func (alwaysNop) nop() {}
+
+type noCopy struct{}
+
+// Lock is a no-op used by -copylocks checker from `go vet`.
+func (*noCopy) Lock()   {}
+func (*noCopy) Unlock() {}
+
+type Bool struct {
+	_ noCopy
+	v uint32
+}
+
+// Load atomically loads and returns the value stored in x.
+func (x *Bool) Load() bool { return atomic.LoadUint32(&x.v) != 0 }
+
+// Store atomically stores val into x.
+func (x *Bool) Store(val bool) {
+	if val {
+		atomic.StoreUint32(&x.v, 1)
+	}
+
+	atomic.StoreUint32(&x.v, 0)
+}
+
+type concreteNop struct {
+	isNop Bool
+	i     int
+}
+
+func (c *concreteNop) nop() {
+	if c.isNop.Load() {
+		return
+	}
+	c.i++
+}
+
+func BenchmarkInterfaceNop(b *testing.B) {
+	n := ifNop(alwaysNop{})
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			n.nop()
+		}
+	})
+}
+
+func BenchmarkConcreteNop(b *testing.B) {
+	n := &concreteNop{}
+	n.isNop.Store(true)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			n.nop()
+		}
+	})
+}
