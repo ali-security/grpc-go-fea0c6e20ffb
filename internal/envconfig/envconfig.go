@@ -21,6 +21,7 @@ package envconfig
 
 import (
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -48,6 +49,15 @@ var (
 	// A future release will remove this environment variable, enabling strict
 	// path checking behavior unconditionally.
 	DisableStrictPathChecking = boolFromEnv("GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING", false)
+
+	// ControlBufferThrottleLimit is the maximum number of control frames that can
+	// be queued in the control buffer before throttling is applied. The value
+	// must be between 1 and 100,000, and is set to 10,000 by default.
+	//
+	// This environment variable serves as an escape hatch to increase the
+	// throttling limit if unforeseen issues arise, and it will be removed in a
+	// future release.
+	ControlBufferThrottleLimit = uint64FromEnv("GRPC_GO_EXPERIMENTAL_CONTROL_BUFFER_THROTTLE_LIMIT", 10000, 1, 100000)
 )
 
 func boolFromEnv(envVar string, def bool) bool {
@@ -56,4 +66,18 @@ func boolFromEnv(envVar string, def bool) bool {
 		return def
 	}
 	return strings.EqualFold(v, "true")
+}
+
+func uint64FromEnv(envVar string, def, min, max uint64) uint64 {
+	v, err := strconv.ParseUint(os.Getenv(envVar), 10, 64)
+	if err != nil {
+		return def
+	}
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
 }

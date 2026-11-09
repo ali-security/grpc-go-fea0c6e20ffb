@@ -173,6 +173,7 @@ proto.RegisterMapType is deprecated
 proto.Unmarshaler is deprecated
 resolver.Backend
 resolver.GRPCLB
+SourceIp is deprecated
 Target is deprecated: Use the Target field in the BuildOptions instead.
 xxx_messageInfo_
 ' "${SC_OUT}"

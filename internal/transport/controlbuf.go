@@ -26,9 +26,11 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
+	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/grpcutil"
 	"google.golang.org/grpc/status"
 )
@@ -85,30 +87,50 @@ func (il *itemList) isEmpty() bool {
 	return il.head == nil
 }
 
+// maxQueuedTransportResponseFrames is the maximum number of "transport
+// response" frames that we will buffer before preventing new reads from
+// occurring on the transport. See cbItem.isTransportResponseFrame for the
+// items that count towards this limit.
+var maxQueuedTransportResponseFrames = int(envconfig.ControlBufferThrottleLimit)
+
+type cbItem interface {
+	// isTransportResponseFrame reports whether the item counts against the
+	// maxQueuedTransportResponseFrames limit, when queued in the
+	// controlBuffer of a transport on the given side.
+	//
+	// Items that the peer can make the transport queue in unbounded
+	// numbers, for example by sending PING or SETTINGS frames, must be
+	// counted, so that the transport stops reading from a peer that sends
+	// such frames without reading what the transport writes. Items whose
+	// number grows with the local application's load (for example, one
+	// per stream it creates) must not be counted. Otherwise, under high
+	// concurrency, both peers could stop reading at the same time and
+	// deadlock (see https://github.com/grpc/grpc-go/issues/9330).
+	isTransportResponseFrame(s side) bool
+}
+
+// nonTransportResponseFrame represents items in the controlBuffer that are not
+// queued in response to peer control/reset frames (for example,
+// locally-initiated or flow-controlled items). These items are not counted
+// against the maxQueuedTransportResponseFrames limit.
+type nonTransportResponseFrame struct{}
+
+func (nonTransportResponseFrame) isTransportResponseFrame(side) bool { return false }
+
 // The following defines various control items which could flow through
 // the control buffer of transport. They represent different aspects of
 // control tasks, e.g., flow control, settings, streaming resetting, etc.
 
-// maxQueuedTransportResponseFrames is the most queued "transport response"
-// frames we will buffer before preventing new reads from occurring on the
-// transport.  These are control frames sent in response to client requests,
-// such as RST_STREAM due to bad headers or settings acks.
-const maxQueuedTransportResponseFrames = 50
-
-type cbItem interface {
-	isTransportResponseFrame() bool
-}
-
 // registerStream is used to register an incoming stream with loopy writer.
 type registerStream struct {
+	nonTransportResponseFrame
 	streamID uint32
 	wq       *writeQuota
 }
 
-func (*registerStream) isTransportResponseFrame() bool { return false }
-
 // headerFrame is also used to register stream on the client-side.
 type headerFrame struct {
+	nonTransportResponseFrame
 	streamID   uint32
 	hf         []hpack.HeaderField
 	endStream  bool               // Valid on server side.
@@ -119,10 +141,6 @@ type headerFrame struct {
 	onOrphaned func(error)    // Valid on client-side
 }
 
-func (h *headerFrame) isTransportResponseFrame() bool {
-	return h.cleanup != nil && h.cleanup.rst // Results in a RST_STREAM
-}
-
 type cleanupStream struct {
 	streamID uint32
 	rst      bool
@@ -130,7 +148,16 @@ type cleanupStream struct {
 	onWrite  func()
 }
 
-func (c *cleanupStream) isTransportResponseFrame() bool { return c.rst } // Results in a RST_STREAM
+// isTransportResponseFrame returns true on the server since cleanupStream
+// either results in a RST_STREAM frame being sent on the wire or in
+// non-trivial work being performed when under a Rapid Reset attack.
+//
+// It returns false on the client, where a cleanupStream is queued at most once
+// per stream, and the number of streams is controlled by the client and not by
+// the server. Counting them on the client makes the client stop reading under
+// high concurrency, which deadlocks with a server that has also stopped
+// reading (see https://github.com/grpc/grpc-go/issues/9330).
+func (*cleanupStream) isTransportResponseFrame(s side) bool { return s == serverSide }
 
 type earlyAbortStream struct {
 	httpStatus     uint32
@@ -139,9 +166,13 @@ type earlyAbortStream struct {
 	status         *status.Status
 }
 
-func (*earlyAbortStream) isTransportResponseFrame() bool { return false }
+// isTransportResponseFrame returns true on the server since earlyAbortStream
+// results in a HEADERS frame being sent on the wire. It is never queued on the
+// client.
+func (*earlyAbortStream) isTransportResponseFrame(s side) bool { return s == serverSide }
 
 type dataFrame struct {
+	nonTransportResponseFrame
 	streamID  uint32
 	endStream bool
 	h         []byte
@@ -151,62 +182,66 @@ type dataFrame struct {
 	onEachWrite func()
 }
 
-func (*dataFrame) isTransportResponseFrame() bool { return false }
-
 type incomingWindowUpdate struct {
 	streamID  uint32
 	increment uint32
 }
 
-func (*incomingWindowUpdate) isTransportResponseFrame() bool { return false }
+// isTransportResponseFrame returns true to protect against a WINDOW_UPDATE
+// flood attack from the peer.
+func (*incomingWindowUpdate) isTransportResponseFrame(side) bool { return true }
 
 type outgoingWindowUpdate struct {
+	nonTransportResponseFrame
 	streamID  uint32
 	increment uint32
-}
-
-func (*outgoingWindowUpdate) isTransportResponseFrame() bool {
-	return false // window updates are throttled by thresholds
 }
 
 type incomingSettings struct {
 	ss []http2.Setting
 }
 
-func (*incomingSettings) isTransportResponseFrame() bool { return true } // Results in a settings ACK
+// isTransportResponseFrame returns true since incomingSettings results in a
+// SETTINGS ACK frame being sent on the wire.
+func (*incomingSettings) isTransportResponseFrame(side) bool { return true }
 
 type outgoingSettings struct {
+	nonTransportResponseFrame
 	ss []http2.Setting
 }
 
-func (*outgoingSettings) isTransportResponseFrame() bool { return false }
-
 type incomingGoAway struct {
+	nonTransportResponseFrame
 }
 
-func (*incomingGoAway) isTransportResponseFrame() bool { return false }
-
 type goAway struct {
+	nonTransportResponseFrame
 	code      http2.ErrCode
 	debugData []byte
 	headsUp   bool
 	closeConn bool
 }
 
-func (*goAway) isTransportResponseFrame() bool { return false }
-
 type ping struct {
 	ack  bool
 	data [8]byte
 }
 
-func (*ping) isTransportResponseFrame() bool { return true }
+// isTransportResponseFrame returns true for all pings, and not only for ping
+// acks sent in response to pings from the peer. This is because a BDP ping is
+// queued in response to a DATA frame (of any size) from the peer, whenever
+// there is no BDP ping outstanding. And since the BDP ping's payload is fixed,
+// the peer can make it look like the BDP ping was acked at any time, by
+// sending a ping ack with that payload. A peer alternating between empty DATA
+// frames and such ping acks would otherwise be able to queue an unbounded
+// number of BDP pings. Pings initiated locally (keepalive and BDP) are rare
+// enough to not cause throttling of well-behaved peers.
+func (*ping) isTransportResponseFrame(side) bool { return true }
 
 type outFlowControlSizeRequest struct {
+	nonTransportResponseFrame
 	resp chan uint32
 }
-
-func (*outFlowControlSizeRequest) isTransportResponseFrame() bool { return false }
 
 type outStreamState int
 
@@ -286,30 +321,36 @@ func (l *outStreamList) dequeue() *outStream {
 type controlBuffer struct {
 	ch              chan struct{}
 	done            <-chan struct{}
+	side            side // Side of the transport owning this buffer.
 	mu              sync.Mutex
 	consumerWaiting bool
 	list            *itemList
 	err             error
 
-	// transportResponseFrames counts the number of queued items that represent
-	// the response of an action initiated by the peer.  trfChan is created
-	// when transportResponseFrames >= maxQueuedTransportResponseFrames and is
-	// closed and nilled when transportResponseFrames drops below the
-	// threshold.  Both fields are protected by mu.
+	// transportResponseFrames counts the number of queued items that
+	// represent the response of an action initiated by the peer (as
+	// determined by cbItem.isTransportResponseFrame for this side).
+	// trfChan is created when transportResponseFrames >=
+	// maxQueuedTransportResponseFrames and is closed and nilled when
+	// transportResponseFrames drops below the threshold. Both fields are
+	// protected by mu.
 	transportResponseFrames int
 	trfChan                 atomic.Value // chan struct{}
 }
 
-func newControlBuffer(done <-chan struct{}) *controlBuffer {
+func newControlBuffer(done <-chan struct{}, s side) *controlBuffer {
 	return &controlBuffer{
 		ch:   make(chan struct{}, 1),
 		list: &itemList{},
 		done: done,
+		side: s,
 	}
 }
 
-// throttle blocks if there are too many incomingSettings/cleanupStreams in the
-// controlbuf.
+// throttle blocks if there are too many items in the control buffer that count
+// towards the maxQueuedTransportResponseFrames limit (see
+// cbItem.isTransportResponseFrame), until their number drops below the limit,
+// the control buffer is finished, or the transport is done.
 func (c *controlBuffer) throttle() {
 	ch, _ := c.trfChan.Load().(chan struct{})
 	if ch != nil {
@@ -317,6 +358,25 @@ func (c *controlBuffer) throttle() {
 		case <-ch:
 		case <-c.done:
 		}
+	}
+}
+
+// throttleWithTimeout is like throttle, but it stops waiting and returns an
+// error if the control buffer is still throttled after the given duration.
+func (c *controlBuffer) throttleWithTimeout(timeout time.Duration) error {
+	ch, _ := c.trfChan.Load().(chan struct{})
+	if ch == nil {
+		return nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return nil
+	case <-c.done:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("still throttled after %v, with at least %d queued frames", timeout, maxQueuedTransportResponseFrames)
 	}
 }
 
@@ -343,7 +403,7 @@ func (c *controlBuffer) executeAndPut(f func(it interface{}) bool, it cbItem) (b
 		c.consumerWaiting = false
 	}
 	c.list.enqueue(it)
-	if it.isTransportResponseFrame() {
+	if it.isTransportResponseFrame(c.side) {
 		c.transportResponseFrames++
 		if c.transportResponseFrames == maxQueuedTransportResponseFrames {
 			// We are adding the frame that puts us over the threshold; create
@@ -385,7 +445,7 @@ func (c *controlBuffer) get(block bool) (interface{}, error) {
 		}
 		if !c.list.isEmpty() {
 			h := c.list.dequeue().(cbItem)
-			if h.isTransportResponseFrame() {
+			if h.isTransportResponseFrame(c.side) {
 				if c.transportResponseFrames == maxQueuedTransportResponseFrames {
 					// We are removing the frame that put us over the
 					// threshold; close and clear the throttling channel.
@@ -431,9 +491,10 @@ func (c *controlBuffer) finish() {
 			hdr.onOrphaned(ErrConnClosing)
 		}
 	}
-	// In case throttle() is currently in flight, it needs to be unblocked.
-	// Otherwise, the transport may not close, since the transport is closed by
-	// the reader encountering the connection error.
+	// In case throttle() or throttleWithTimeout() is currently in flight,
+	// it needs to be unblocked. Otherwise, the transport may not close,
+	// since the transport is closed by the reader encountering the
+	// connection error.
 	ch, _ := c.trfChan.Load().(chan struct{})
 	if ch != nil {
 		close(ch)
