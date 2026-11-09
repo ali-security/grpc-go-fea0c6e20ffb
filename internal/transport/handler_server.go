@@ -355,7 +355,7 @@ func (ht *serverHandlerTransport) HandleStreams(startStream func(*Stream), trace
 		id:             0, // irrelevant
 		requestRead:    func(int) {},
 		cancel:         cancel,
-		buf:            newRecvBuffer(),
+		buf:            newRecvBuffer(nil),
 		st:             ht,
 		method:         req.URL.Path,
 		recvCompress:   req.Header.Get("grpc-encoding"),

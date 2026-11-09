@@ -447,7 +447,7 @@ func (t *http2Client) newStream(ctx context.Context, callHdr *CallHdr) *Stream {
 		done:           make(chan struct{}),
 		method:         callHdr.Method,
 		sendCompress:   callHdr.SendCompress,
-		buf:            newRecvBuffer(),
+		buf:            newRecvBuffer(t.bufferPool),
 		headerChan:     make(chan struct{}),
 		contentSubtype: callHdr.ContentSubtype,
 		doneFunc:       callHdr.DoneFunc,
