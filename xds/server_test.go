@@ -29,12 +29,16 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/credentials/tls/certprovider"
 	"google.golang.org/grpc/credentials/xds"
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/testutils"
+	"google.golang.org/grpc/internal/transport"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	_ "google.golang.org/grpc/xds/internal/httpfilter/router"
 	xdstestutils "google.golang.org/grpc/xds/internal/testutils"
 	"google.golang.org/grpc/xds/internal/testutils/e2e"
@@ -888,4 +892,44 @@ func verifyCertProviderNotCreated() error {
 		return errors.New("certificate provider created when no xDS creds were specified")
 	}
 	return nil
+}
+
+// fakeVirtualHostsConn is a net.Conn which provides the virtual hosts to
+// routeAndProcess, as the xDS server's connection wrapper does.
+type fakeVirtualHostsConn struct {
+	net.Conn
+	vhs []xdsresource.VirtualHostWithInterceptors
+}
+
+func (c *fakeVirtualHostsConn) VirtualHosts() []xdsresource.VirtualHostWithInterceptors {
+	return c.vhs
+}
+
+type testServerTransportStream struct {
+	method string
+}
+
+func (s *testServerTransportStream) Method() string               { return s.method }
+func (s *testServerTransportStream) SetHeader(metadata.MD) error  { return nil }
+func (s *testServerTransportStream) SendHeader(metadata.MD) error { return nil }
+func (s *testServerTransportStream) SetTrailer(metadata.MD) error { return nil }
+
+// TestRouteAndProcessMissingAuthority tests that an incoming RPC with no
+// :authority header in its metadata is failed with status code Internal by the
+// xDS routing logic, instead of causing a panic.
+func (s) TestRouteAndProcessMissingAuthority(t *testing.T) {
+	cw := &fakeVirtualHostsConn{vhs: []xdsresource.VirtualHostWithInterceptors{}}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	ctx = transport.SetConnection(ctx, cw)
+	ctx = grpc.NewContextWithServerTransportStream(ctx, &testServerTransportStream{method: "/test.Service/Method"})
+	ctx = metadata.NewIncomingContext(ctx, metadata.MD{})
+
+	err := routeAndProcess(ctx)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("routeAndProcess() returned error code %v, want %v", status.Code(err), codes.Internal)
+	}
+	if !strings.Contains(err.Error(), "no :authority header present") {
+		t.Fatalf("routeAndProcess() returned error message %q, want %q", err.Error(), "no :authority header present")
+	}
 }

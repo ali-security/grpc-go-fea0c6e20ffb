@@ -233,7 +233,7 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 
 	done := make(chan struct{})
 	t := &http2Server{
-		ctx:               setConnection(context.Background(), rawConn),
+		ctx:               SetConnection(context.Background(), rawConn),
 		done:              done,
 		conn:              conn,
 		remoteAddr:        conn.RemoteAddr(),
@@ -463,6 +463,22 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 	} else {
 		// "If :authority is present, Host must be discarded" - A41
 		delete(mdata, "host")
+	}
+
+	// If :authority is still missing, i.e. no host or :authority header is
+	// present, reject the request as invalid.
+	if len(mdata[":authority"]) == 0 {
+		errMsg := "no host or :authority header present"
+		if logger.V(logLevel) {
+			logger.Infof("transport: http2Server.operateHeaders aborting the stream early: %v", errMsg)
+		}
+		t.controlBuf.put(&earlyAbortStream{
+			httpStatus:     400,
+			streamID:       streamID,
+			contentSubtype: s.contentSubtype,
+			status:         status.New(codes.Internal, errMsg),
+		})
+		return false
 	}
 
 	if frame.StreamEnded() {
@@ -1423,6 +1439,6 @@ func GetConnection(ctx context.Context) net.Conn {
 // SetConnection adds the connection to the context to be able to get
 // information about the destination ip and port for an incoming RPC. This also
 // allows any unary or streaming interceptors to see the connection.
-func setConnection(ctx context.Context, conn net.Conn) context.Context {
+func SetConnection(ctx context.Context, conn net.Conn) context.Context {
 	return context.WithValue(ctx, connectionKey{}, conn)
 }

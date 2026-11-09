@@ -1954,6 +1954,140 @@ func (s) TestHeadersMultipleHosts(t *testing.T) {
 	}
 }
 
+// TestHeadersMissingAuthorityAndHost tests that a gRPC request with neither an
+// :authority nor a host header gets rejected with HTTP Status 400 and gRPC
+// status Internal.
+func (s) TestHeadersMissingAuthorityAndHost(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers []struct {
+			name   string
+			values []string
+		}
+		httpStatusWant  string
+		grpcStatusWant  string
+		grpcMessageWant string
+	}{
+		// If neither :authority nor host header is present on a gRPC request, the
+		// request should be rejected with HTTP Status 400 and gRPC status Internal.
+		{
+			name: "Missing authority and host header grpc",
+			headers: []struct {
+				name   string
+				values []string
+			}{
+				{name: ":method", values: []string{"POST"}},
+				{name: ":path", values: []string{"foo"}},
+				{name: "content-type", values: []string{"application/grpc"}},
+			},
+			httpStatusWant:  "400",
+			grpcStatusWant:  "13",
+			grpcMessageWant: "no host or :authority header present",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := setUpServerOnly(t, 0, &ServerConfig{}, suspended)
+			defer server.stop()
+			// Create a client directly to not tie what you can send to API of
+			// http2_client.go (i.e. control headers being sent).
+			mconn, err := net.Dial("tcp", server.lis.Addr().String())
+			if err != nil {
+				t.Fatalf("Client failed to dial: %v", err)
+			}
+			defer mconn.Close()
+
+			if n, err := mconn.Write(clientPreface); err != nil || n != len(clientPreface) {
+				t.Fatalf("mconn.Write(clientPreface) = %d, %v, want %d, <nil>", n, err, len(clientPreface))
+			}
+
+			framer := http2.NewFramer(mconn, mconn)
+			framer.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+			if err := framer.WriteSettings(); err != nil {
+				t.Fatalf("Error while writing settings: %v", err)
+			}
+
+			// result chan indicates that reader received a Headers Frame with
+			// desired grpc status and message from server. An error will be
+			// passed on it if any other frame is received.
+			result := testutils.NewChannel()
+
+			// Launch a reader goroutine.
+			go func() {
+				for {
+					frame, err := framer.ReadFrame()
+					if err != nil {
+						return
+					}
+					switch frame := frame.(type) {
+					case *http2.SettingsFrame:
+						// Do nothing. A settings frame is expected from server preface.
+					case *http2.MetaHeadersFrame:
+						var httpStatus, grpcStatus, grpcMessage string
+						for _, header := range frame.Fields {
+							if header.Name == ":status" {
+								httpStatus = header.Value
+							}
+							if header.Name == "grpc-status" {
+								grpcStatus = header.Value
+							}
+							if header.Name == "grpc-message" {
+								grpcMessage = header.Value
+							}
+						}
+						if httpStatus != test.httpStatusWant {
+							result.Send(fmt.Errorf("incorrect HTTP Status got %v, want %v", httpStatus, test.httpStatusWant))
+							return
+						}
+						if grpcStatus != test.grpcStatusWant {
+							result.Send(fmt.Errorf("incorrect gRPC Status got %v, want %v", grpcStatus, test.grpcStatusWant))
+							return
+						}
+						if !strings.Contains(grpcMessage, test.grpcMessageWant) {
+							result.Send(fmt.Errorf("incorrect gRPC message, got %q, want %q", grpcMessage, test.grpcMessageWant))
+							return
+						}
+
+						// Records that client successfully received a HeadersFrame
+						// with expected Trailers-Only response.
+						result.Send(nil)
+						return
+					default:
+						// The server should send nothing but a single Settings and Headers frame.
+						result.Send(errors.New("the client received a frame other than Settings or Headers"))
+					}
+				}
+			}()
+
+			var buf bytes.Buffer
+			henc := hpack.NewEncoder(&buf)
+
+			// Needs to build headers deterministically to conform to gRPC over
+			// HTTP/2 spec.
+			for _, header := range test.headers {
+				for _, value := range header.values {
+					if err := henc.WriteField(hpack.HeaderField{Name: header.name, Value: value}); err != nil {
+						t.Fatalf("Error while encoding header: %v", err)
+					}
+				}
+			}
+
+			if err := framer.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: buf.Bytes(), EndHeaders: true}); err != nil {
+				t.Fatalf("Error while writing headers: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+			r, err := result.Receive(ctx)
+			if err != nil {
+				t.Fatalf("Error receiving from channel: %v", err)
+			}
+			if r != nil {
+				t.Fatalf("want nil, got %v", r)
+			}
+		})
+	}
+}
+
 func (s) TestPingPong1B(t *testing.T) {
 	runPingPongTest(t, 1)
 }
