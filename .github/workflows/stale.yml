@@ -2,12 +2,11 @@ name: Stale bot
 
 on:
   workflow_dispatch:
-  schedule:
-  - cron: "44 */2 * * *"
 
 jobs:
   stale:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       issues: write
       pull-requests: write

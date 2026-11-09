@@ -295,7 +295,7 @@ func testNewConfigWithFileContentEnv(t *testing.T, fileName string, wantError bo
 	t.Helper()
 	b, err := bootstrapFileReadFunc(fileName)
 	if err != nil {
-		t.Skip(err)
+		t.Skipf("bootstrap file %q has no fake content (%v): this case only checks the file-content env var for files the test defines", fileName, err)
 	}
 	origBootstrapContent := envconfig.XDSBootstrapFileContent
 	envconfig.XDSBootstrapFileContent = string(b)

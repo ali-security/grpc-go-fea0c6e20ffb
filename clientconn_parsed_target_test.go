@@ -23,6 +23,7 @@ import (
 	"errors"
 	"net"
 	"net/url"
+	"runtime"
 	"testing"
 	"time"
 
@@ -115,6 +116,9 @@ func (s) TestParsedTarget_Failure_WithoutCustomDialer(t *testing.T) {
 }
 
 func (s) TestParsedTarget_WithCustomDialer(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket paths are not supported on Windows")
+	}
 	defScheme := resolver.GetDefaultScheme()
 	tests := []struct {
 		target            string

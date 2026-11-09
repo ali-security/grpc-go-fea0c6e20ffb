@@ -2,10 +2,12 @@ name: Testing
 
 # Trigger on pushes, PRs (excluding documentation changes), and nightly.
 on:
-  push:
-  pull_request:
-  schedule:
-    - cron: 0 0 * * * # daily at 00:00
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Comma-separated test names to run (empty = full suite)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -17,6 +19,8 @@ env:
 jobs:
   # Check generated protos match their source repos (optional for PRs).
   vet-proto:
+    # disabled on the seal fork: vet.sh -install fetches today's linters, which no longer build on Go 1.15
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -33,13 +37,69 @@ jobs:
         run: ./vet.sh -install && ./vet.sh
 
   # Run the main gRPC-Go tests.
+  # Build the module zip (the artifact proxy.golang.org serves) on the seal fork.
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: 1.17
+
+      - name: Checkout repo
+        uses: actions/checkout@v2
+
+      - name: Create module zip
+        run: |
+          cp -r "${GITHUB_WORKSPACE}" /tmp/modsrc
+          rm -rf /tmp/modsrc/.git
+          mkdir -p /tmp/ziphelper /tmp/out
+          cd /tmp/ziphelper
+          go mod init ziphelper
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+                  "os"
+
+                  "golang.org/x/mod/module"
+                  "golang.org/x/mod/zip"
+          )
+
+          func main() {
+                  f, err := os.Create(os.Args[3])
+                  if err != nil {
+                      panic(err)
+                  }
+                  defer f.Close()
+                  if err := zip.CreateFromDir(f, module.Version{Path: os.Args[1], Version: os.Args[2]}, os.Args[4]); err != nil {
+                      panic(err)
+                  }
+          }
+          EOF
+          go get golang.org/x/mod@v0.8.0
+          go run . google.golang.org/grpc v1.43.0 /tmp/out/v1.43.0.zip /tmp/modsrc
+          ls -l /tmp/out
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: /tmp/out/v1.43.0.zip
+          if-no-files-found: error
+
   tests:
     # Proto checks are run in the above job.
     env:
       VET_SKIP_PROTO: 1
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     strategy:
+      fail-fast: false
       matrix:
         include:
           - type: vet+tests
@@ -66,6 +126,16 @@ jobs:
           - type: tests
             goversion: 1.15
 
+          # Windows leg added on the seal fork (required OS coverage).
+          # Go 1.18: Go 1.17 x509.SystemCertPool() is unimplemented on Windows.
+          # x509sha1=1: the repo's test certs are SHA1-signed, rejected by default since Go 1.18.
+          # 20m: the test package exceeds 7m on Windows runners.
+          - type: tests
+            goversion: 1.18
+            runner: windows-latest
+            grpcenv: GODEBUG=x509sha1=1
+            gotimeout: 20m
+
     steps:
       # Setup the environment.
       - name: Setup GOARCH
@@ -77,6 +147,11 @@ jobs:
         # setup qemu-user-static emulator and register it with binfmt_misc so that aarch64 binaries
         # are automatically executed using qemu.
         run: docker run --rm --privileged multiarch/qemu-user-static:5.2.0-2 --reset --credential yes --persistent yes
+
+      # Old (Go <=1.17) TSAN cannot map memory with the 32-bit ASLR entropy of current ubuntu runners.
+      - name: Lower ASLR entropy for the race detector
+        if: matrix.testflags == '-race'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
 
       - name: Setup GRPC environment
         if: matrix.grpcenv != ''
@@ -92,8 +167,19 @@ jobs:
 
       # Only run vet for 'vet' runs.
       - name: Run vet.sh
-        if: startsWith(matrix.type, 'vet')
+        # disabled on the seal fork: lint gate; vet.sh -install fetches today's linters
+        if: false
         run: ./vet.sh -install && ./vet.sh
+
+      # gotestsum prints per-test results, a skipped-test report and a pass/skip summary.
+      # Prebuilt binary: `go install` of gotestsum needs a newer Go than 1.15/1.16.
+      - name: Install gotestsum
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then os=windows; else os=linux; fi
+          mkdir -p "$RUNNER_TEMP/gotestsum"
+          cd "$RUNNER_TEMP/gotestsum"
+          curl -sSfL "https://github.com/gotestyourself/gotestsum/releases/download/v1.12.0/gotestsum_1.12.0_${os}_amd64.tar.gz" | tar -xz
+          echo "$RUNNER_TEMP/gotestsum" >> "$GITHUB_PATH"
 
       # Main tests run for everything except when testing "extras"
       # (where we run a reduced set of tests).
@@ -101,14 +187,17 @@ jobs:
         if: contains(matrix.type, 'tests')
         run: |
           go version
-          go test ${{ matrix.testflags }} -cpu 1,4 -timeout 7m google.golang.org/grpc/...
-          cd ${GITHUB_WORKSPACE}/security/advancedtls && go test ${{ matrix.testflags }} -timeout 2m google.golang.org/grpc/security/advancedtls/...
-          cd ${GITHUB_WORKSPACE}/security/authorization && go test ${{ matrix.testflags }} -timeout 2m google.golang.org/grpc/security/authorization/...
+          FILTER="${{ inputs.test-filter }}"
+          RUNARGS=()
+          if [ -n "$FILTER" ]; then RUNARGS=(-run "${FILTER//,/|}"); fi
+          gotestsum --format testname -- ${{ matrix.testflags }} "${RUNARGS[@]}" -cpu 1,4 -timeout ${{ matrix.gotimeout || '7m' }} google.golang.org/grpc/...
+          cd "${GITHUB_WORKSPACE}/security/advancedtls" && gotestsum --format testname -- ${{ matrix.testflags }} "${RUNARGS[@]}" -timeout 2m google.golang.org/grpc/security/advancedtls/...
+          cd "${GITHUB_WORKSPACE}/security/authorization" && gotestsum --format testname -- ${{ matrix.testflags }} "${RUNARGS[@]}" -timeout 2m google.golang.org/grpc/security/authorization/...
 
 
       # Non-core gRPC tests (examples, interop, etc)
       - name: Run extras tests
-        if: matrix.type == 'extras'
+        if: matrix.type == 'extras' && inputs.test-filter == ''
         run: |
           go version
           examples/examples_test.sh

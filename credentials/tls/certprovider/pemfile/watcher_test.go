@@ -24,6 +24,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"runtime"
 	"testing"
 	"time"
 
@@ -310,6 +311,9 @@ func (s) TestProvider_UpdateSuccess(t *testing.T) {
 // symlink is updates to point to new files. Verifies that the changes are
 // picked up by the provider.
 func (s) TestProvider_UpdateSuccessWithSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior differs on Windows")
+	}
 	// Override the newDistributor to one which pushes on a channel that we
 	// can block on.
 	origDistributorFunc := newDistributor
